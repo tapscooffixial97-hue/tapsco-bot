@@ -14,14 +14,14 @@ CHAT_IDS = [
     "7507688010"
 ]
 
+# Only major OTC-like currency pairs for stronger signals
 SYMBOLS = [
-    "EURUSD=X",
-    "GBPUSD=X",
-    "USDJPY=X",
-    "AUDUSD=X"
+    "EURUSD=X", "GBPUSD=X", "USDJPY=X", "AUDUSD=X", "USDCAD=X",
+    "USDCHF=X", "NZDUSD=X", "EURJPY=X", "GBPJPY=X", "GBPAUD=X"
 ]
 
 MAX_SIGNALS_PER_DAY = 10  # limit signals per day
+EXPIRY_MINUTES = 2        # default expiry for OTC trades
 bot = Bot(token=TOKEN)
 signal_active = False
 signals_sent_today = 0
@@ -38,44 +38,32 @@ async def send_message(text):
 def get_data(symbol):
     try:
         df = yf.download(symbol, interval="1m", period="1d")
-        if df.empty or len(df) < 15:
+        if df.empty or len(df) < 2:
             return None
         return df
     except Exception as e:
-        print(f"Error downloading {symbol}: {e}")
+        print(f"Data error for {symbol}: {e}")
         return None
 
-# ========= RSI CALCULATION =========
-def calculate_rsi(df, period=14):
-    delta = df["Close"].diff()
-    gain = delta.where(delta > 0, 0)
-    loss = -delta.where(delta < 0, 0)
-    avg_gain = gain.rolling(window=period, min_periods=1).mean()
-    avg_loss = loss.rolling(window=period, min_periods=1).mean()
-    rs = avg_gain / avg_loss.replace(0, 0.0001)
-    df["RSI"] = 100 - (100 / (1 + rs))
-    return df
-
-# ========= SUPPORT & RESISTANCE =========
-def support_resistance(df, lookback=20):
-    # Recent high/low levels
-    recent_high = df["High"].rolling(lookback).max().iloc[-1]
-    recent_low = df["Low"].rolling(lookback).min().iloc[-1]
-    return recent_high, recent_low
-
-# ========= CHECK CANDLE PATTERNS =========
+# ========= CHECK CANDLE ENGULFING PATTERN =========
 def check_pattern(df):
+    """
+    Detects bullish/bearish engulfing pattern
+    Returns: signal ("BUY"/"SELL") and strength ("strong"/"moderate")
+    """
     last = df.iloc[-1]
     prev = df.iloc[-2]
 
     body = abs(last['Close'] - last['Open'])
     prev_body = abs(prev['Close'] - prev['Open'])
 
-    # Engulfing / strong candle detection
+    # Strong bullish engulfing
     if last['Close'] > last['Open'] and prev['Close'] < prev['Open'] and body > prev_body * 1.1:
         return "BUY", "strong"
+    # Strong bearish engulfing
     if last['Close'] < last['Open'] and prev['Close'] > prev['Open'] and body > prev_body * 1.1:
         return "SELL", "strong"
+    
     return None, None
 
 # ========= CHECK RESULT =========
@@ -84,7 +72,7 @@ async def check_result(symbol, direction, entry, expiry_minutes):
     df = get_data(symbol)
     if df is None:
         return "UNKNOWN"
-    close_price = float(df["Close"].iloc[-1].item())
+    close_price = float(df["Close"].iloc[-1])
     if direction == "BUY":
         return "WIN" if close_price > entry else "LOSS"
     if direction == "SELL":
@@ -94,49 +82,20 @@ async def check_result(symbol, direction, entry, expiry_minutes):
 async def wait_for_next_candle():
     now = datetime.now(timezone(timedelta(hours=1)))  # UTC+1
     next_candle = (now + timedelta(minutes=1 - now.minute % 1)).replace(second=0, microsecond=0)
-    wait_seconds = (next_candle - now).total_seconds() - 5  # 5s before candle
+    wait_seconds = (next_candle - now).total_seconds() - 5  # send 5s before candle
     if wait_seconds > 0:
         await asyncio.sleep(wait_seconds)
-
-# ========= AI CONFIDENCE SCORE =========
-def ai_confidence(df, signal):
-    score = 0
-    last_rsi = df["RSI"].iloc[-1]
-    ema50 = df["Close"].ewm(span=50).mean().iloc[-1]
-    price = df["Close"].iloc[-1]
-
-    # Trend direction
-    if signal == "BUY" and price > ema50:
-        score += 30
-    if signal == "SELL" and price < ema50:
-        score += 30
-
-    # RSI
-    if signal == "BUY" and last_rsi < 70:
-        score += 20
-    if signal == "SELL" and last_rsi > 30:
-        score += 20
-
-    # Candle strength
-    score += 25  # strong pattern already
-
-    # Volatility
-    recent_range = df["High"].iloc[-5:].max() - df["Low"].iloc[-5:].min()
-    if recent_range > 0:
-        score += 15
-
-    return score
 
 # ========= MAIN BOT =========
 async def run_bot():
     global signal_active, signals_sent_today
-    print("🔥 TAPSCO AI BOT V1 STARTED 🔥")
-    await send_message("🔥 TAPSCO AI BOT V1 IS ACTIVE 🔥")
+    print("🔥 TAPSCO ELITE BOT V4 STARTED 🔥")
+    await send_message("🔥 TAPSCO BOT V4 IS ACTIVE 🔥")
 
     while True:
         if signals_sent_today >= MAX_SIGNALS_PER_DAY:
             print("Daily signal limit reached")
-            await asyncio.sleep(60)  # wait 1 min
+            await asyncio.sleep(60)  # wait 1 min before checking again
             continue
 
         if signal_active:
@@ -147,52 +106,29 @@ async def run_bot():
 
         for symbol in SYMBOLS:
             try:
-                print("Scanning", symbol)
                 df = get_data(symbol)
                 if df is None:
                     continue
 
-                df = calculate_rsi(df)
                 signal, strength = check_pattern(df)
-                if signal is None:
-                    continue
 
-                # Support & Resistance filter
-                sr_high, sr_low = support_resistance(df)
-                price = df["Close"].iloc[-1]
-
-                if signal == "BUY" and price >= sr_high:
-                    print(f"{symbol} BUY blocked by resistance")
-                    continue
-                if signal == "SELL" and price <= sr_low:
-                    print(f"{symbol} SELL blocked by support")
-                    continue
-
-                # AI confidence check
-                confidence = ai_confidence(df, signal)
-                if confidence < 70:
-                    print(f"{symbol} signal confidence {confidence}% too low")
-                    continue
-
-                if not signal_active:
+                if signal is not None and not signal_active:
                     signal_active = True
                     signals_sent_today += 1
-                    entry = float(df["Close"].iloc[-1].item())
-                    expiry = 2  # 2-min trade for 1-min signals
+                    entry = float(df["Close"].iloc[-1])
+                    expiry = EXPIRY_MINUTES
 
                     message = f"""
-🔥 TAPSCO AI SIGNAL 🔥
+🔥 TAPSCO ELITE BOT V4
 
 PAIR: {symbol}
 SIGNAL: {signal} ({strength.upper()})
-CONFIDENCE: {confidence}%
 ENTRY: {entry}
 TIME: {datetime.now(timezone(timedelta(hours=1))):%H:%M} (UTC+1)
 EXPIRY: {expiry} MIN
 """
                     await send_message(message)
 
-                    # Check result
                     result = await check_result(symbol, signal, entry, expiry)
                     result_msg = f"""
 📊 TRADE RESULT
@@ -208,7 +144,7 @@ RESULT: {result}
             except Exception as e:
                 print("Error:", e)
 
-        await asyncio.sleep(2)  # short wait to loop
+        await asyncio.sleep(2)
 
 # ========= START BOT =========
 asyncio.run(run_bot())
