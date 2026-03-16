@@ -14,14 +14,8 @@ CHAT_IDS = [
     "7507688010"
 ]
 
-# Only strong, major currency pairs
-SYMBOLS = [
-    "EURUSD=X", "GBPUSD=X", "USDJPY=X", "AUDUSD=X", 
-    "USDCAD=X", "USDCHF=X", "NZDUSD=X", 
-    "EURJPY=X", "GBPJPY=X", "GBPAUD=X"
-]
-
-MAX_SIGNALS_PER_DAY = 10  # limit signals per day
+PAIR = "XAUUSD=X"  # Gold
+MAX_SIGNALS_PER_DAY = 5  # limit daily signals
 bot = Bot(token=TOKEN)
 signal_active = False
 signals_sent_today = 0
@@ -35,84 +29,64 @@ async def send_message(text):
             print("Telegram error:", e)
 
 # ========= GET MARKET DATA =========
-def get_data(symbol):
-    try:
-        df = yf.download(symbol, interval="5m", period="1d")
-        if df.empty or len(df) < 2:
-            return None
-        return df
-    except Exception as e:
-        print(f"Error fetching data for {symbol}: {e}")
+def get_data(symbol, interval="5m", period="1d"):
+    df = yf.download(symbol, interval=interval, period=period)
+    if df.empty:
         return None
-
-# ========= RSI CALCULATION =========
-def calculate_rsi(df, period=14):
-    delta = df["Close"].diff()
-    gain = delta.where(delta > 0, 0)
-    loss = -delta.where(delta < 0, 0)
-    avg_gain = gain.rolling(window=period, min_periods=1).mean()
-    avg_loss = loss.rolling(window=period, min_periods=1).mean()
-    rs = avg_gain / avg_loss.replace(0, 0.0001)
-    df["RSI"] = 100 - (100 / (1 + rs))
     return df
 
-# ========= CANDLE PATTERN SIGNAL =========
-def check_pattern(df):
-    """
-    Detects strong bullish/bearish engulfing pattern.
-    Returns signal type ("BUY"/"SELL") and strength ("strong"/"moderate")
-    """
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
+# ========= 4H TREND DETECTION =========
+def detect_4h_trend(df_4h):
+    highs = df_4h['High'].tail(10)
+    lows = df_4h['Low'].tail(10)
 
-    last_body = abs(last['Close'] - last['Open'])
+    if highs.iloc[-1] > highs.iloc[-2] and lows.iloc[-1] > lows.iloc[-2]:
+        return "UP"
+    if highs.iloc[-1] < highs.iloc[-2] and lows.iloc[-1] < lows.iloc[-2]:
+        return "DOWN"
+    return "SIDEWAYS"
+
+# ========= ORDER BLOCK DETECTION =========
+def detect_order_block(df_5m):
+    last = df_5m.iloc[-1]
+    prev = df_5m.iloc[-2]
+
+    body = abs(last['Close'] - last['Open'])
     prev_body = abs(prev['Close'] - prev['Open'])
-    candle_range = last['High'] - last['Low'] if last['High'] != last['Low'] else 0.0001
 
-    # Strong bullish
-    if last['Close'] > last['Open'] and last_body > 0.6 * candle_range:
-        if prev['Close'] < prev['Open']:
-            return "BUY", "strong"
-        return "BUY", "moderate"
+    # Bullish order block
+    if last['Close'] > last['Open'] and prev['Close'] < prev['Open'] and body > prev_body * 1.1:
+        return "BUY", last['Low'], last['High']
+    # Bearish order block
+    if last['Close'] < last['Open'] and prev['Close'] > prev['Open'] and body > prev_body * 1.1:
+        return "SELL", last['High'], last['Low']
 
-    # Strong bearish
-    if last['Close'] < last['Open'] and last_body > 0.6 * candle_range:
-        if prev['Close'] > prev['Open']:
-            return "SELL", "strong"
-        return "SELL", "moderate"
+    return None, None, None
 
-    return None, None
+# ========= CHECK RESULT PLACEHOLDER =========
+async def check_result(entry, direction, sl, tp):
+    # For demo, just wait 5 minutes
+    await asyncio.sleep(300)
+    return "UNKNOWN"  # manual checking for now
 
-# ========= CHECK RESULT =========
-async def check_result(symbol, direction, entry, expiry_minutes):
-    await asyncio.sleep(expiry_minutes * 60)
-    df = get_data(symbol)
-    if df is None:
-        return "UNKNOWN"
-    close_price = float(df["Close"].iloc[-1])
-    if direction == "BUY":
-        return "WIN" if close_price > entry else "LOSS"
-    if direction == "SELL":
-        return "WIN" if close_price < entry else "LOSS"
-
-# ========= WAIT UNTIL NEXT CANDLE =========
+# ========= WAIT UNTIL NEXT 5-MIN CANDLE =========
 async def wait_for_next_candle():
     now = datetime.now(timezone(timedelta(hours=1)))  # UTC+1
     next_candle = (now + timedelta(minutes=5 - now.minute % 5)).replace(second=0, microsecond=0)
-    wait_seconds = (next_candle - now).total_seconds() - 10  # send 10s before candle
+    wait_seconds = (next_candle - now).total_seconds() - 5
     if wait_seconds > 0:
         await asyncio.sleep(wait_seconds)
 
 # ========= MAIN BOT =========
 async def run_bot():
     global signal_active, signals_sent_today
-    print("🔥 TAPSCO ELITE BOT V4 STARTED 🔥")
-    await send_message("🔥 TAPSCO BOT V4 IS ACTIVE 🔥")
+    print("🔥 GOLD PRICE ACTION BOT STARTED 🔥")
+    await send_message("🔥 GOLD PRICE ACTION BOT ACTIVE 🔥")
 
     while True:
         if signals_sent_today >= MAX_SIGNALS_PER_DAY:
             print("Daily signal limit reached")
-            await asyncio.sleep(300)  # wait 5 min
+            await asyncio.sleep(300)
             continue
 
         if signal_active:
@@ -121,54 +95,60 @@ async def run_bot():
 
         await wait_for_next_candle()
 
-        for symbol in SYMBOLS:
-            try:
-                print(f"Scanning {symbol}")
-                df = get_data(symbol)
-                if df is None:
-                    continue
+        try:
+            # Get 4H trend
+            df_4h = get_data(PAIR, interval="4h", period="10d")
+            if df_4h is None or len(df_4h) < 5:
+                continue
+            trend = detect_4h_trend(df_4h)
+            if trend == "SIDEWAYS":
+                continue
 
-                df = calculate_rsi(df)
-                signal, strength = check_pattern(df)
+            # Get 5m candles
+            df_5m = get_data(PAIR, interval="5m", period="1d")
+            if df_5m is None or len(df_5m) < 15:
+                continue
 
-                # RSI filter
-                last_rsi = df["RSI"].iloc[-1]
-                if signal == "BUY" and last_rsi > 60:
-                    signal = None
-                if signal == "SELL" and last_rsi < 40:
-                    signal = None
+            # Detect order block
+            signal, entry_low, entry_high = detect_order_block(df_5m)
+            if signal is None:
+                continue
 
-                if signal and not signal_active:
-                    signal_active = True
-                    signals_sent_today += 1
-                    entry = float(df["Close"].iloc[-1])
-                    expiry = 5 if strength == "strong" else 3
+            # Only trade in direction of trend
+            if (trend == "UP" and signal != "BUY") or (trend == "DOWN" and signal != "SELL"):
+                continue
 
-                    message = f"""
-🔥 TAPSCO ELITE BOT V4
+            signal_active = True
+            signals_sent_today += 1
+            entry_price = (entry_low + entry_high) / 2
+            sl = entry_low - 0.5 if signal == "BUY" else entry_high + 0.5
+            tp = entry_high + 1 if signal == "BUY" else entry_low - 1
 
-PAIR: {symbol}
-SIGNAL: {signal} ({strength.upper()})
-ENTRY: {entry}
+            message = f"""
+🔥 GOLD SETUP ALERT
+
+SIGNAL: {signal}
+ENTRY: {entry_price:.2f}
+SL: {sl:.2f}
+TP: {tp:.2f}
+TREND (4H): {trend}
 TIME: {datetime.now(timezone(timedelta(hours=1))):%H:%M} (UTC+1)
-EXPIRY: {expiry} MIN
 """
-                    await send_message(message)
+            await send_message(message)
 
-                    result = await check_result(symbol, signal, entry, expiry)
-                    result_msg = f"""
+            result = await check_result(entry_price, signal, sl, tp)
+            result_msg = f"""
 📊 TRADE RESULT
 
-PAIR: {symbol}
+PAIR: {PAIR}
 SIGNAL: {signal}
 RESULT: {result}
 """
-                    await send_message(result_msg)
-                    signal_active = False
-                    break
+            await send_message(result_msg)
+            signal_active = False
 
-            except Exception as e:
-                print("Error:", e)
+        except Exception as e:
+            print("Error:", e)
 
         await asyncio.sleep(5)
 
