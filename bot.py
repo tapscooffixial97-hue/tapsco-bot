@@ -14,14 +14,14 @@ CHAT_IDS = [
     "7507688010"
 ]
 
-# Only major OTC-like currency pairs for stronger signals
+# Only strong, major currency pairs
 SYMBOLS = [
-    "EURUSD=X", "GBPUSD=X", "USDJPY=X", "AUDUSD=X", "USDCAD=X",
-    "USDCHF=X", "NZDUSD=X", "EURJPY=X", "GBPJPY=X", "GBPAUD=X"
+    "EURUSD=X", "GBPUSD=X", "USDJPY=X", "AUDUSD=X", 
+    "USDCAD=X", "USDCHF=X", "NZDUSD=X", 
+    "EURJPY=X", "GBPJPY=X", "GBPAUD=X"
 ]
 
 MAX_SIGNALS_PER_DAY = 10  # limit signals per day
-EXPIRY_MINUTES = 2        # default expiry for OTC trades
 bot = Bot(token=TOKEN)
 signal_active = False
 signals_sent_today = 0
@@ -37,33 +37,50 @@ async def send_message(text):
 # ========= GET MARKET DATA =========
 def get_data(symbol):
     try:
-        df = yf.download(symbol, interval="1m", period="1d")
+        df = yf.download(symbol, interval="5m", period="1d")
         if df.empty or len(df) < 2:
             return None
         return df
     except Exception as e:
-        print(f"Data error for {symbol}: {e}")
+        print(f"Error fetching data for {symbol}: {e}")
         return None
 
-# ========= CHECK CANDLE ENGULFING PATTERN =========
+# ========= RSI CALCULATION =========
+def calculate_rsi(df, period=14):
+    delta = df["Close"].diff()
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
+    avg_gain = gain.rolling(window=period, min_periods=1).mean()
+    avg_loss = loss.rolling(window=period, min_periods=1).mean()
+    rs = avg_gain / avg_loss.replace(0, 0.0001)
+    df["RSI"] = 100 - (100 / (1 + rs))
+    return df
+
+# ========= CANDLE PATTERN SIGNAL =========
 def check_pattern(df):
     """
-    Detects bullish/bearish engulfing pattern
-    Returns: signal ("BUY"/"SELL") and strength ("strong"/"moderate")
+    Detects strong bullish/bearish engulfing pattern.
+    Returns signal type ("BUY"/"SELL") and strength ("strong"/"moderate")
     """
     last = df.iloc[-1]
     prev = df.iloc[-2]
 
-    body = abs(last['Close'] - last['Open'])
+    last_body = abs(last['Close'] - last['Open'])
     prev_body = abs(prev['Close'] - prev['Open'])
+    candle_range = last['High'] - last['Low'] if last['High'] != last['Low'] else 0.0001
 
-    # Strong bullish engulfing
-    if last['Close'] > last['Open'] and prev['Close'] < prev['Open'] and body > prev_body * 1.1:
-        return "BUY", "strong"
-    # Strong bearish engulfing
-    if last['Close'] < last['Open'] and prev['Close'] > prev['Open'] and body > prev_body * 1.1:
-        return "SELL", "strong"
-    
+    # Strong bullish
+    if last['Close'] > last['Open'] and last_body > 0.6 * candle_range:
+        if prev['Close'] < prev['Open']:
+            return "BUY", "strong"
+        return "BUY", "moderate"
+
+    # Strong bearish
+    if last['Close'] < last['Open'] and last_body > 0.6 * candle_range:
+        if prev['Close'] > prev['Open']:
+            return "SELL", "strong"
+        return "SELL", "moderate"
+
     return None, None
 
 # ========= CHECK RESULT =========
@@ -78,11 +95,11 @@ async def check_result(symbol, direction, entry, expiry_minutes):
     if direction == "SELL":
         return "WIN" if close_price < entry else "LOSS"
 
-# ========= WAIT UNTIL NEXT 1-MIN CANDLE =========
+# ========= WAIT UNTIL NEXT CANDLE =========
 async def wait_for_next_candle():
     now = datetime.now(timezone(timedelta(hours=1)))  # UTC+1
-    next_candle = (now + timedelta(minutes=1 - now.minute % 1)).replace(second=0, microsecond=0)
-    wait_seconds = (next_candle - now).total_seconds() - 5  # send 5s before candle
+    next_candle = (now + timedelta(minutes=5 - now.minute % 5)).replace(second=0, microsecond=0)
+    wait_seconds = (next_candle - now).total_seconds() - 10  # send 10s before candle
     if wait_seconds > 0:
         await asyncio.sleep(wait_seconds)
 
@@ -95,28 +112,37 @@ async def run_bot():
     while True:
         if signals_sent_today >= MAX_SIGNALS_PER_DAY:
             print("Daily signal limit reached")
-            await asyncio.sleep(60)  # wait 1 min before checking again
+            await asyncio.sleep(300)  # wait 5 min
             continue
 
         if signal_active:
-            await asyncio.sleep(2)
+            await asyncio.sleep(5)
             continue
 
         await wait_for_next_candle()
 
         for symbol in SYMBOLS:
             try:
+                print(f"Scanning {symbol}")
                 df = get_data(symbol)
                 if df is None:
                     continue
 
+                df = calculate_rsi(df)
                 signal, strength = check_pattern(df)
 
-                if signal is not None and not signal_active:
+                # RSI filter
+                last_rsi = df["RSI"].iloc[-1]
+                if signal == "BUY" and last_rsi > 60:
+                    signal = None
+                if signal == "SELL" and last_rsi < 40:
+                    signal = None
+
+                if signal and not signal_active:
                     signal_active = True
                     signals_sent_today += 1
                     entry = float(df["Close"].iloc[-1])
-                    expiry = EXPIRY_MINUTES
+                    expiry = 5 if strength == "strong" else 3
 
                     message = f"""
 🔥 TAPSCO ELITE BOT V4
@@ -144,7 +170,7 @@ RESULT: {result}
             except Exception as e:
                 print("Error:", e)
 
-        await asyncio.sleep(2)
+        await asyncio.sleep(5)
 
 # ========= START BOT =========
 asyncio.run(run_bot())
