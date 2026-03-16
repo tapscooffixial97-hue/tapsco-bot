@@ -14,7 +14,7 @@ CHAT_IDS = [
     "7507688010"
 ]
 
-# Only major currency pairs (stronger signals)
+# Only major currency pairs
 SYMBOLS = [
     "EURUSD=X", "GBPUSD=X", "USDJPY=X", "AUDUSD=X", "USDCAD=X", "USDCHF=X", "NZDUSD=X",
     "EURGBP=X", "EURJPY=X", "GBPJPY=X", "GBPAUD=X"
@@ -35,10 +35,14 @@ async def send_message(text):
 
 # ========= GET MARKET DATA =========
 def get_data(symbol):
-    df = yf.download(symbol, interval="5m", period="1d")  # 5-min candles
-    if df.empty:
+    try:
+        df = yf.download(symbol, interval="5m", period="1d")
+        if df.empty or len(df) < 15:
+            return None
+        return df
+    except Exception as e:
+        print(f"Data fetch error for {symbol}: {e}")
         return None
-    return df
 
 # ========= RSI CALCULATION =========
 def calculate_rsi(df, period=14):
@@ -54,20 +58,26 @@ def calculate_rsi(df, period=14):
 # ========= CHECK CANDLE ENGULFING PATTERN =========
 def check_pattern(df):
     """
-    Returns BUY/SELL signal and strength if engulfing pattern detected
+    Detect engulfing patterns and return BUY/SELL signal with strength
     """
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
+    try:
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
 
-    # Candle bodies
-    body = abs(last['Close'] - last['Open'])
-    prev_body = abs(prev['Close'] - prev['Open'])
+        body = abs(last['Close'] - last['Open'])
+        prev_body = abs(prev['Close'] - prev['Open'])
 
-    # Check engulfing
-    if last['Close'] > last['Open'] and prev['Close'] < prev['Open'] and body > prev_body * 1.1:
-        return "BUY", "strong"
-    if last['Close'] < last['Open'] and prev['Close'] > prev['Open'] and body > prev_body * 1.1:
-        return "SELL", "strong"
+        # Strong bullish engulfing
+        if last['Close'] > last['Open'] and prev['Close'] < prev['Open'] and body > prev_body * 1.1:
+            return "BUY", "strong"
+
+        # Strong bearish engulfing
+        if last['Close'] < last['Open'] and prev['Close'] > prev['Open'] and body > prev_body * 1.1:
+            return "SELL", "strong"
+
+    except Exception as e:
+        print("Pattern check error:", e)
+
     return None, None
 
 # ========= CHECK RESULT =========
@@ -76,11 +86,15 @@ async def check_result(symbol, direction, entry, expiry_minutes):
     df = get_data(symbol)
     if df is None:
         return "UNKNOWN"
-    close_price = float(df["Close"].iloc[-1].item())
-    if direction == "BUY":
-        return "WIN" if close_price > entry else "LOSS"
-    if direction == "SELL":
-        return "WIN" if close_price < entry else "LOSS"
+    try:
+        close_price = float(df["Close"].iloc[-1])
+        if direction == "BUY":
+            return "WIN" if close_price > entry else "LOSS"
+        if direction == "SELL":
+            return "WIN" if close_price < entry else "LOSS"
+    except Exception as e:
+        print(f"Result calculation error for {symbol}: {e}")
+        return "UNKNOWN"
 
 # ========= WAIT UNTIL NEXT 5-MIN CANDLE =========
 async def wait_for_next_candle():
@@ -99,7 +113,7 @@ async def run_bot():
     while True:
         if signals_sent_today >= MAX_SIGNALS_PER_DAY:
             print("Daily signal limit reached")
-            await asyncio.sleep(300)  # wait 5 min
+            await asyncio.sleep(300)
             continue
 
         if signal_active:
@@ -112,7 +126,7 @@ async def run_bot():
             try:
                 print("Scanning", symbol)
                 df = get_data(symbol)
-                if df is None or len(df) < 15:
+                if df is None:
                     continue
 
                 df = calculate_rsi(df)
@@ -128,7 +142,7 @@ async def run_bot():
                 if signal and not signal_active:
                     signal_active = True
                     signals_sent_today += 1
-                    entry = float(df["Close"].iloc[-1].item())
+                    entry = float(df["Close"].iloc[-1])
                     expiry = 5 if strength == "strong" else 3
 
                     message = f"""
@@ -155,7 +169,7 @@ RESULT: {result}
                     break
 
             except Exception as e:
-                print("Error:", e)
+                print("Error scanning symbol:", symbol, e)
 
         await asyncio.sleep(5)
 
