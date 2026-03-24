@@ -2,7 +2,7 @@ import asyncio
 import pandas as pd
 import yfinance as yf
 from telegram import Bot
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
 # ========= CONFIG =========
 TOKEN = "8652056910:AAE4Z9E8Du6BiZoHPeugJvt7ksmhC9mlt0g"
@@ -14,11 +14,13 @@ CHAT_IDS = [
     "7507688010"
 ]
 
-PAIR = "XAUUSD=X"  # Gold
-MAX_SIGNALS_PER_DAY = 5  # limit daily signals
+SYMBOLS = [
+    "EURUSD=X", "GBPUSD=X", "USDJPY=X", "AUDUSD=X",
+    "USDCAD=X", "USDCHF=X", "NZDUSD=X"
+]
+
 bot = Bot(token=TOKEN)
 signal_active = False
-signals_sent_today = 0
 
 # ========= TELEGRAM MESSAGE =========
 async def send_message(text):
@@ -29,128 +31,163 @@ async def send_message(text):
             print("Telegram error:", e)
 
 # ========= GET MARKET DATA =========
-def get_data(symbol, interval="5m", period="1d"):
-    df = yf.download(symbol, interval=interval, period=period)
-    if df.empty:
+def get_data(symbol):
+    try:
+        df = yf.download(symbol, interval="1m", period="1d")
+
+        if df is None or df.empty or len(df) < 50:
+            return None
+
+        df = df.dropna()
+
+        # 🔥 FIX: handle multi-index columns (main cause of your error)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+
+        if "Close" not in df.columns:
+            return None
+
+        return df
+
+    except Exception as e:
+        print("Data error:", e)
         return None
+
+# ========= CALCULATE EMA =========
+def calculate_ema(df):
+    df["EMA20"] = df["Close"].ewm(span=20).mean()
+    df["EMA50"] = df["Close"].ewm(span=50).mean()
     return df
 
-# ========= 4H TREND DETECTION =========
-def detect_4h_trend(df_4h):
-    highs = df_4h['High'].tail(10)
-    lows = df_4h['Low'].tail(10)
+# ========= SAFE FLOAT FUNCTION =========
+def safe_float(value):
+    try:
+        if pd.isna(value):
+            return None
+        return float(value.item() if hasattr(value, "item") else value)
+    except:
+        return None
 
-    if highs.iloc[-1] > highs.iloc[-2] and lows.iloc[-1] > lows.iloc[-2]:
-        return "UP"
-    if highs.iloc[-1] < highs.iloc[-2] and lows.iloc[-1] < lows.iloc[-2]:
-        return "DOWN"
-    return "SIDEWAYS"
+# ========= CHECK SIGNAL =========
+def check_signal(df):
+    try:
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
+        prev2 = df.iloc[-3]
 
-# ========= ORDER BLOCK DETECTION =========
-def detect_order_block(df_5m):
-    last = df_5m.iloc[-1]
-    prev = df_5m.iloc[-2]
+        ema20_last = safe_float(last["EMA20"])
+        ema50_last = safe_float(last["EMA50"])
 
-    body = abs(last['Close'] - last['Open'])
-    prev_body = abs(prev['Close'] - prev['Open'])
+        ema20_prev = safe_float(prev["EMA20"])
+        ema50_prev = safe_float(prev["EMA50"])
 
-    # Bullish order block
-    if last['Close'] > last['Open'] and prev['Close'] < prev['Open'] and body > prev_body * 1.1:
-        return "BUY", last['Low'], last['High']
-    # Bearish order block
-    if last['Close'] < last['Open'] and prev['Close'] > prev['Open'] and body > prev_body * 1.1:
-        return "SELL", last['High'], last['Low']
+        ema20_prev2 = safe_float(prev2["EMA20"])
+        ema50_prev2 = safe_float(prev2["EMA50"])
 
-    return None, None, None
+        if None in [ema20_last, ema50_last, ema20_prev, ema50_prev, ema20_prev2, ema50_prev2]:
+            return None
 
-# ========= CHECK RESULT PLACEHOLDER =========
-async def check_result(entry, direction, sl, tp):
-    # For demo, just wait 5 minutes
-    await asyncio.sleep(300)
-    return "UNKNOWN"  # manual checking for now
+        # BUY
+        if ema20_prev2 < ema50_prev2 and ema20_prev < ema50_prev and ema20_last > ema50_last:
+            return "BUY"
 
-# ========= WAIT UNTIL NEXT 5-MIN CANDLE =========
+        # SELL
+        if ema20_prev2 > ema50_prev2 and ema20_prev > ema50_prev and ema20_last < ema50_last:
+            return "SELL"
+
+        return None
+
+    except Exception as e:
+        print("Signal error:", e)
+        return None
+
+# ========= CHECK RESULT =========
+async def check_result(symbol, direction, entry):
+    await asyncio.sleep(300)  # 5 minutes
+
+    df = get_data(symbol)
+    if df is None:
+        return "UNKNOWN"
+
+    close_price = safe_float(df["Close"].iloc[-1])
+    if close_price is None:
+        return "UNKNOWN"
+
+    if direction == "BUY":
+        return "WIN ✅" if close_price > entry else "LOSS ❌"
+    if direction == "SELL":
+        return "WIN ✅" if close_price < entry else "LOSS ❌"
+
+# ========= WAIT FOR NEXT CANDLE =========
 async def wait_for_next_candle():
-    now = datetime.now(timezone(timedelta(hours=1)))  # UTC+1
-    next_candle = (now + timedelta(minutes=5 - now.minute % 5)).replace(second=0, microsecond=0)
+    now = datetime.now()
+    next_candle = (now + timedelta(minutes=1)).replace(second=0, microsecond=0)
     wait_seconds = (next_candle - now).total_seconds() - 5
     if wait_seconds > 0:
         await asyncio.sleep(wait_seconds)
 
 # ========= MAIN BOT =========
 async def run_bot():
-    global signal_active, signals_sent_today
-    print("🔥 GOLD PRICE ACTION BOT STARTED 🔥")
-    await send_message("🔥 GOLD PRICE ACTION BOT ACTIVE 🔥")
+    global signal_active
+
+    print("🔥 TAPSCO BOT ACTIVE 🔥")
+    await send_message("🔥 TAPSCO BOT IS ACTIVE 🔥")
 
     while True:
-        if signals_sent_today >= MAX_SIGNALS_PER_DAY:
-            print("Daily signal limit reached")
-            await asyncio.sleep(300)
-            continue
-
         if signal_active:
             await asyncio.sleep(5)
             continue
 
         await wait_for_next_candle()
 
-        try:
-            # Get 4H trend
-            df_4h = get_data(PAIR, interval="4h", period="10d")
-            if df_4h is None or len(df_4h) < 5:
-                continue
-            trend = detect_4h_trend(df_4h)
-            if trend == "SIDEWAYS":
-                continue
+        for symbol in SYMBOLS:
+            try:
+                print("Scanning", symbol)
 
-            # Get 5m candles
-            df_5m = get_data(PAIR, interval="5m", period="1d")
-            if df_5m is None or len(df_5m) < 15:
-                continue
+                df = get_data(symbol)
+                if df is None:
+                    continue
 
-            # Detect order block
-            signal, entry_low, entry_high = detect_order_block(df_5m)
-            if signal is None:
-                continue
+                df = calculate_ema(df)
+                signal = check_signal(df)
 
-            # Only trade in direction of trend
-            if (trend == "UP" and signal != "BUY") or (trend == "DOWN" and signal != "SELL"):
-                continue
+                if signal and not signal_active:
+                    entry = safe_float(df["Close"].iloc[-1])
+                    if entry is None:
+                        continue
 
-            signal_active = True
-            signals_sent_today += 1
-            entry_price = (entry_low + entry_high) / 2
-            sl = entry_low - 0.5 if signal == "BUY" else entry_high + 0.5
-            tp = entry_high + 1 if signal == "BUY" else entry_low - 1
+                    signal_active = True
 
-            message = f"""
-🔥 GOLD SETUP ALERT
+                    message = f"""
+🔥 TAPSCO BOT
 
+PAIR: {symbol}
 SIGNAL: {signal}
-ENTRY: {entry_price:.2f}
-SL: {sl:.2f}
-TP: {tp:.2f}
-TREND (4H): {trend}
-TIME: {datetime.now(timezone(timedelta(hours=1))):%H:%M} (UTC+1)
+ENTRY: {entry}
+TIME: {datetime.now().strftime("%H:%M")}
+EXPIRY: 5 MIN
 """
-            await send_message(message)
+                    await send_message(message)
 
-            result = await check_result(entry_price, signal, sl, tp)
-            result_msg = f"""
-📊 TRADE RESULT
+                    result = await check_result(symbol, signal, entry)
 
-PAIR: {PAIR}
+                    result_msg = f"""
+📊 RESULT
+
+PAIR: {symbol}
 SIGNAL: {signal}
+ENTRY: {entry}
 RESULT: {result}
 """
-            await send_message(result_msg)
-            signal_active = False
+                    await send_message(result_msg)
 
-        except Exception as e:
-            print("Error:", e)
+                    signal_active = False
+                    break
+
+            except Exception as e:
+                print("Error:", e)
 
         await asyncio.sleep(5)
 
-# ========= START BOT =========
+# ========= START =========
 asyncio.run(run_bot())
