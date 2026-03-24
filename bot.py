@@ -11,7 +11,8 @@ CHAT_IDS = [
     "6725248203",
     "7189407746",
     "7012611005",
-    "7507688010"
+    "7507688010",
+    "7514230390"
 ]
 
 SYMBOLS = [
@@ -40,7 +41,7 @@ def get_data(symbol):
 
         df = df.dropna()
 
-        # 🔥 FIX: handle multi-index columns (main cause of your error)
+        # 🔥 FIX: handle multi-index columns
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
 
